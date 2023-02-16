@@ -103,8 +103,6 @@ func GetSerialPort(ttyPort *string) (serial.Port, error) {
 		StopBits: 0,               // 0 == 1 stop bit
 	}
 
-	log.Print(ports)
-
 	// use last port TODO: make this more robust, its hacky and not guaranteed to work
 	port := ports[len(ports)-1]
 	log.Printf("Using port: %s", port)
@@ -187,13 +185,18 @@ func (lidar *YDLidar) DeviceInfo() (*string, error) {
 	deviceInfo.Hardware = data[3:4][0]
 	copy(deviceInfo.Serial[:], data[4:20])
 
+	runes := make([]rune, len(deviceInfo.Serial))
+	for i, b := range deviceInfo.Serial {
+		runes[i] = rune(b + '0')
+	}
+
 	stringDeviceInfo := &DeviceInfoString{}
 
 	if deviceInfo.Model == 15 {
 		stringDeviceInfo.Model = "G2"
 		stringDeviceInfo.Firmware = fmt.Sprintf("%v.%v", deviceInfo.Firmware[0], deviceInfo.Firmware[1])
 		stringDeviceInfo.Hardware = fmt.Sprintf("%v", deviceInfo.Hardware)
-		info := fmt.Sprintf("Device Info: Model: %v Hardware Version: %v Firmware Version: %v Serial Number: %v\n", stringDeviceInfo.Model, stringDeviceInfo.Hardware, stringDeviceInfo.Firmware, deviceInfo.Serial)
+		info := fmt.Sprintf("Device Info: Model: %v Hardware Version: %v Firmware Version: %v Serial Number: %v\n", stringDeviceInfo.Model, stringDeviceInfo.Hardware, stringDeviceInfo.Firmware, string(runes))
 		return &info, nil
 	} else {
 		return nil, fmt.Errorf("unknown model: %v", deviceInfo.Model)
@@ -275,7 +278,7 @@ func (lidar *YDLidar) readInfoHeader() (sizeOfMessage byte, typeCode byte, mode 
 // see startScan for more details.
 func (lidar *YDLidar) StartScan() {
 
-	// n is the number of bytes per scan sample (Check your lidar's datasheet
+	// n is the number of bytes per scan sample for the YDLidar G4 (Check your lidar's datasheet)
 	n := 3
 
 	// Send start scanning command to device.
