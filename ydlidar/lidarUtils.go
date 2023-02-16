@@ -105,18 +105,11 @@ func GetSerialPort(ttyPort *string) (serial.Port, error) {
 
 	log.Print(ports)
 
-	// use last port
+	// use last port TODO: make this more robust, its hacky and not guaranteed to work
 	port := ports[len(ports)-1]
 	log.Printf("Using port: %s", port)
 
 	currentPort, err := serial.Open(port, mode)
-
-	//for _, port := range ports {
-	//	currentPort, err := serial.Open(port, mode)
-	//	if err != nil {
-	//		log.Print("Ignoring error: ", err)
-	//	}
-	//
 
 	err = currentPort.SetDTR(true)
 	if err != nil {
@@ -126,8 +119,6 @@ func GetSerialPort(ttyPort *string) (serial.Port, error) {
 	log.Print("Connected to port: ", currentPort)
 
 	return currentPort, nil
-
-	log.Panic("Could not create a connection with the found serial ports!")
 
 	return nil, nil
 }
@@ -146,7 +137,10 @@ func (lidar *YDLidar) SetupCloseHandler() {
 			return
 		}
 
-		lidar.SerialPort.ResetOutputBuffer()
+		err = lidar.SerialPort.ResetOutputBuffer()
+		if err != nil {
+			return
+		}
 
 		err = lidar.Close()
 		if err != nil {
@@ -286,6 +280,9 @@ func (lidar *YDLidar) readInfoHeader() (sizeOfMessage byte, typeCode byte, mode 
 // see startScan for more details.
 func (lidar *YDLidar) StartScan() {
 
+	// n is the number of bytes per scan sample (Check your lidar's datasheet
+	n := 3
+
 	// Send start scanning command to device.
 	if _, err := lidar.SerialPort.Write([]byte{preCommand, startScanning}); err != nil {
 		lidar.sendErr(fmt.Errorf("failed to start scan: %v", err))
@@ -409,40 +406,15 @@ func (lidar *YDLidar) StartScan() {
 						continue
 					}
 
-					// TODO Hoist conversions to separate function.
-
-					// TODO Create intensity conversion function.
-					//////////////////////////////////Intensity Calculations//////////////////////////////////
-
-					// Si represents the number of samples.
-					// Split the individualSampleBytes slice into a slice of slices.
-					// Each slice is 3 theBytes long.
-					// The outer slice is the number of samples.
-					// The inner slice is the number of theBytes per sample.
-					n := 3
 					samples := make([][]byte, len(individualSampleBytes)/n)
 
-					intensities := make([]int, len(individualSampleBytes)/n)
-					distances := make([]float32, len(individualSampleBytes)/n)
-					for Si := range samples {
-						samples[Si] = individualSampleBytes[Si*n : (Si+1)*n]
-						// uint16(samples[Si][0]) means we take the whole first byte of this grouping
-						// uint16(samples[Si][1]&0x3) means...&0x3 leaves us with the low two bits of the 2nd byte.
-						intensity := int(samples[Si][0])
-						IH := int(samples[Si][1] & 0x3)
-						intensities[Si] = intensity + IH*256
-						log.Printf("intensity: %v", intensity)
+					//////////////////////////////////Intensity Calculations//////////////////////////
+					intensities := calculateIntensity(individualSampleBytes, samples, n)
+					/////////////////////////////////////////////////////////////////////////////////
 
-						/////////////////////////DISTANCES/////////////////////////////////////
-						// Distance𝑖 = Lshiftbit(Si(3), 6) + Rshiftbit(Si(2), 2)
-						// This variable represents the distance in millimeters.
-						// uint16(samples[Si][2]) << 6 means we take the whole third byte of this grouping and shift it 6 bits to the left.
-						// uint16(samples[Si][1]) >> 2 means we take the whole second byte of this grouping and shift it 2 bits to the right.
-						distance := (uint16(samples[Si][2]) << 6) + (uint16(samples[Si][1]) >> 2)
-						distances[Si] = float32(distance)
-
-						log.Printf("distance: %vmm", distance)
-					}
+					//////////////////////////////////Distance Calculations///////////////////////////
+					distances := calculateDistance(individualSampleBytes, samples, n)
+					/////////////////////////////////////////////////////////////////////////////////
 
 					//////////////////////////////Angle Calculations//////////////////////////////////
 					angles := calculateAngles(distances, pointCloud.StartAngle, pointCloud.EndAngle, sampleQuantityPackets)
@@ -495,7 +467,6 @@ func checkScanPacket(headerData []byte, sampleData []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed to pack header struct: %v", err)
 	}
-	log.Printf("Length of header packet to XOR: %v", len(C1))
 
 	C2 := make([]uint16, 1)
 	bufferedC2 := bytes.NewBuffer(headerData[4:6])
@@ -503,7 +474,6 @@ func checkScanPacket(headerData []byte, sampleData []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed to pack header struct: %v", err)
 	}
-	log.Printf("Length of header packet to XOR: %v", len(C2))
 
 	nextToLastC := make([]uint16, 1)
 	bufferedNextToLastC := bytes.NewBuffer(headerData[2:4])
@@ -511,7 +481,6 @@ func checkScanPacket(headerData []byte, sampleData []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed to pack header struct: %v", err)
 	}
-	log.Printf("Length of header packet to XOR: %v", len(nextToLastC))
 
 	lastC := make([]uint16, 1)
 	bufferedLastC := bytes.NewBuffer(headerData[6:8])
@@ -519,14 +488,13 @@ func checkScanPacket(headerData []byte, sampleData []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed to pack header struct: %v", err)
 	}
-	log.Printf("Length of header packet to XOR: %v", len(lastC))
 
 	// Calculate Xor of all bits.
-	for i, B := range C1 { // for each byte in the packet
+	for _, B := range C1 { // for each byte in the packet
 		// XOR the current byte with the previous XOR
 		checkCode ^= byte(B)
 
-		switch i {
+		switch B {
 
 		case 0:
 			// Check the first byte.
@@ -606,7 +574,7 @@ func GetPointCloud(packet Packet) (pointClouds []PointCloudData) {
 		return
 	}
 
-	for i, _ := range packet.Distances {
+	for i := range packet.Distances {
 		intensity := packet.Intensities[i]
 		dist := packet.Distances[i]
 		angle := packet.Angles[i]
@@ -657,17 +625,16 @@ func (lidar *YDLidar) Close() error {
 func calculateAngles(distances []float32, endAngle uint16, startAngle uint16, sampleQuantity uint8) []float32 {
 
 	angles := make([]float32, sampleQuantity)
-
 	angleCorFSA := angleCorrect(distances[0])
-	angleFSA := float32(startAngle>>1)/64 + angleCorFSA
-
 	angleCorLSA := angleCorrect(distances[sampleQuantity-1])
+
+	angleFSA := float32(startAngle>>1)/64 + angleCorFSA
 	angleLSA := float32(endAngle>>1)/64 + angleCorLSA
 
-	angleDiff := float32(math.Mod(float64(float32(angleLSA-angleFSA)), 360))
+	angleDiff := float32(math.Mod(float64(angleLSA-angleFSA), 360))
 
 	for i := 0; i < len(distances); i++ {
-		angle := angleDiff/float32(sampleQuantity-1)*float32(i) + float32(endAngle) + angleCorrect(distances[i])
+		angle := angleDiff/float32(sampleQuantity-1)*float32(i) + angleLSA + angleCorrect(distances[i])
 		angles[i] = angle
 	}
 
@@ -675,7 +642,7 @@ func calculateAngles(distances []float32, endAngle uint16, startAngle uint16, sa
 
 }
 
-// angleCorrect calculates the corrected angle for Lidar.
+// angleCorrect calculates the corrected angles for Lidar.
 func angleCorrect(dist float32) float32 {
 	if dist == 0 {
 		return 0
@@ -683,10 +650,44 @@ func angleCorrect(dist float32) float32 {
 	return float32(180 / math.Pi * math.Atan(21.8*(155.3-float64(dist))/(155.3*float64(dist))))
 }
 
-func calculateIntensity(intensity uint16) float32 {
-	return float32(intensity) / 100
+// calculateIntensity calculates the strength of the laser.
+func calculateIntensity(individualSampleBytes []byte, samples [][]byte, n int) []int {
+	// Si represents the number of samples.
+	// Split the individualSampleBytes slice into a slice of slices.
+	// Each slice is 3 theBytes long.
+	// The outer slice is the number of samples.
+	// The inner slice is the number of theBytes per sample.
+	intensities := make([]int, len(individualSampleBytes)/n)
+
+	for Si := range samples {
+		samples[Si] = individualSampleBytes[Si*n : (Si+1)*n]
+		// uint16(samples[Si][0]) means we take the whole first byte of this grouping
+		// uint16(samples[Si][1]&0x3) means...&0x3 leaves us with the low two bits of the 2nd byte.
+		intensity := int(samples[Si][0])
+		IH := int(samples[Si][1] & 0x3)
+		intensities[Si] = intensity + IH*256
+	}
+	return intensities
 }
 
-func calculateDistance(distance uint16) float32 {
-	return float32(distance) / 4
+// calculateDistances calculates the distances.
+func calculateDistance(individualSampleBytes []byte, samples [][]byte, n int) []float32 {
+	// Si represents the number of samples.
+	// Split the individualSampleBytes slice into a slice of slices.
+	// Each slice is 3 theBytes long.
+	// The outer slice is the number of samples.
+	// The inner slice is the number of theBytes per sample.
+	distances := make([]float32, len(individualSampleBytes)/n)
+	for Si := range samples {
+		samples[Si] = individualSampleBytes[Si*n : (Si+1)*n]
+
+		/////////////////////////DISTANCES/////////////////////////////////////
+		// Distance𝑖 = Lshiftbit(Si(3), 6) + Rshiftbit(Si(2), 2)
+		// This variable represents the distance in millimeters.
+		// uint16(samples[Si][2]) << 6 means we take the whole third byte of this grouping and shift it 6 bits to the left.
+		// uint16(samples[Si][1]) >> 2 means we take the whole second byte of this grouping and shift it 2 bits to the right.
+		distance := (uint16(samples[Si][2]) << 6) + (uint16(samples[Si][1]) >> 2)
+		distances[Si] = float32(distance)
+	}
+	return distances
 }
