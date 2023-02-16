@@ -318,7 +318,7 @@ func (lidar *YDLidar) StartScan() {
 				var numHeaderBytesReceived int
 				var numSampleBytesReceived int
 
-				// The initial scan packet header is 10 theBytes.
+				// The initial scan packet header is 10 bytes.
 				rawHeaderData := make([]byte, scanPacketHeaderSize)
 				numHeaderBytesReceived, err := lidar.SerialPort.Read(rawHeaderData)
 				if err != nil {
@@ -357,7 +357,7 @@ func (lidar *YDLidar) StartScan() {
 					//There is only one zero point of data in the zero start data packet. The sampleQuantityPackets is 1. We skip this packet.
 					log.Printf("ZERO START DATA PACKET")
 					if numSampleBytesReceived != scanPacketHeaderSize {
-						log.Printf("not enough theBytes in header. Expected %v got %v", scanPacketHeaderSize, numSampleBytesReceived)
+						log.Printf("not enough bytes in header. Expected %v got %v", scanPacketHeaderSize, numSampleBytesReceived)
 					}
 					if sampleQuantityPackets != 1 {
 						log.Printf("sample quantity should be 1, got %v", sampleQuantityPackets)
@@ -393,14 +393,14 @@ func (lidar *YDLidar) StartScan() {
 					}
 
 					// Unpack the rawSampleData into the individualSampleBytes slice.
-					// the outer slice is the number of samples, the inner slice is the number of theBytes per sample
+					// the outer slice is the number of samples, the inner slice is the number of bytes per sample
 					individualSampleBytes := make([]byte, lengthOfSampleData) //
 					if err = binary.Read(bytes.NewBuffer(rawSampleData), binary.LittleEndian, &individualSampleBytes); err != nil {
 						log.Panic(fmt.Errorf("failed to pack struct: %v", err))
 					}
 
 					// Check Scan Packet Type.
-					err = checkScanPacket(rawHeaderData, individualSampleBytes)
+					err = checkScanPacket(rawHeaderData, individualSampleBytes, n)
 					if err != nil {
 						log.Printf(err.Error())
 						continue
@@ -409,11 +409,11 @@ func (lidar *YDLidar) StartScan() {
 					samples := make([][]byte, len(individualSampleBytes)/n)
 
 					//////////////////////////////////Intensity Calculations//////////////////////////
-					intensities := calculateIntensity(individualSampleBytes, samples, n)
+					intensities := calculateIntensities(individualSampleBytes, samples, n)
 					/////////////////////////////////////////////////////////////////////////////////
 
 					//////////////////////////////////Distance Calculations///////////////////////////
-					distances := calculateDistance(individualSampleBytes, samples, n)
+					distances := calculateDistances(individualSampleBytes, samples, n)
 					/////////////////////////////////////////////////////////////////////////////////
 
 					//////////////////////////////Angle Calculations//////////////////////////////////
@@ -453,7 +453,7 @@ func (lidar *YDLidar) extractScanPacketHeader(pointCloud pointCloudHeader) (uint
 }
 
 // checkScanPacket validates the type of the packet.
-func checkScanPacket(headerData []byte, sampleData []byte) error {
+func checkScanPacket(headerData []byte, sampleData []byte, n int) error {
 	checkCode := byte(0)
 
 	// Make a slice big enough to hold headerData (minus the check code position) and sampleData.
@@ -521,7 +521,7 @@ func checkScanPacket(headerData []byte, sampleData []byte) error {
 		checkCode ^= byte(B)
 	}
 
-	samplePacket := make([]uint16, len(sampleData)/3)
+	samplePacket := make([]uint16, len(sampleData)/n)
 	bufferedSamples := bytes.NewBuffer(sampleData)
 	err = binary.Read(bufferedSamples, binary.LittleEndian, &samplePacket)
 	if err != nil {
@@ -540,23 +540,7 @@ func checkScanPacket(headerData []byte, sampleData []byte) error {
 		// XOR the current byte with the previous XOR
 		checkCode ^= byte(B)
 
-		switch i {
-		case 0:
-			// Check the first byte.
-		}
 	}
-
-	//if dataPacket[0]>>8 != 0 {
-	//	return fmt.Errorf("error: upper 8 bits of first byte are not zero-filled")
-	//}
-	//
-	//// XOR the zero-filled upper 8 bits of the first byte
-	//checkCode ^= byte(dataPacket[0] >> 8)
-	//
-	//// Check the check code.
-	//if checkCode != headerData[8] {
-	//	return fmt.Errorf("error: check code does not match")
-	//}
 
 	return nil
 }
@@ -596,6 +580,7 @@ func (lidar *YDLidar) StopScan() error {
 	}
 	lidar.Stop <- struct{}{}
 	lidar.SerialPort.ResetOutputBuffer()
+	lidar.SerialPort.ResetInputBuffer()
 	return nil
 
 }
@@ -624,6 +609,14 @@ func (lidar *YDLidar) Close() error {
 // calculateAngles calculates the angles of the first and last sample.
 func calculateAngles(distances []float32, endAngle uint16, startAngle uint16, sampleQuantity uint8) []float32 {
 
+	// angleCorrect calculates the corrected angles for Lidar.
+	angleCorrect := func(dist float32) float32 {
+		if dist == 0 {
+			return 0
+		}
+		return float32(180 / math.Pi * math.Atan(21.8*(155.3-float64(dist))/(155.3*float64(dist))))
+	}
+
 	angles := make([]float32, sampleQuantity)
 	angleCorFSA := angleCorrect(distances[0])
 	angleCorLSA := angleCorrect(distances[sampleQuantity-1])
@@ -642,27 +635,19 @@ func calculateAngles(distances []float32, endAngle uint16, startAngle uint16, sa
 
 }
 
-// angleCorrect calculates the corrected angles for Lidar.
-func angleCorrect(dist float32) float32 {
-	if dist == 0 {
-		return 0
-	}
-	return float32(180 / math.Pi * math.Atan(21.8*(155.3-float64(dist))/(155.3*float64(dist))))
-}
-
-// calculateIntensity calculates the strength of the laser.
-func calculateIntensity(individualSampleBytes []byte, samples [][]byte, n int) []int {
+// calculateIntensities calculates the strength of the laser.
+func calculateIntensities(individualSampleBytes []byte, samples [][]byte, n int) []int {
 	// Si represents the number of samples.
 	// Split the individualSampleBytes slice into a slice of slices.
-	// Each slice is 3 theBytes long.
+	// Each slice is 3 bytes long.
 	// The outer slice is the number of samples.
-	// The inner slice is the number of theBytes per sample.
+	// The inner slice is the number of bytes per sample.
 	intensities := make([]int, len(individualSampleBytes)/n)
 
 	for Si := range samples {
 		samples[Si] = individualSampleBytes[Si*n : (Si+1)*n]
 		// uint16(samples[Si][0]) means we take the whole first byte of this grouping
-		// uint16(samples[Si][1]&0x3) means...&0x3 leaves us with the low two bits of the 2nd byte.
+		// uint16(samples[Si][1]&0x3) means the low two bits of the 2nd byte.
 		intensity := int(samples[Si][0])
 		IH := int(samples[Si][1] & 0x3)
 		intensities[Si] = intensity + IH*256
@@ -671,12 +656,12 @@ func calculateIntensity(individualSampleBytes []byte, samples [][]byte, n int) [
 }
 
 // calculateDistances calculates the distances.
-func calculateDistance(individualSampleBytes []byte, samples [][]byte, n int) []float32 {
+func calculateDistances(individualSampleBytes []byte, samples [][]byte, n int) []float32 {
 	// Si represents the number of samples.
 	// Split the individualSampleBytes slice into a slice of slices.
-	// Each slice is 3 theBytes long.
+	// Each inner slice is 3 bytes long.
 	// The outer slice is the number of samples.
-	// The inner slice is the number of theBytes per sample.
+	// The inner slice is the number of bytes per sample.
 	distances := make([]float32, len(individualSampleBytes)/n)
 	for Si := range samples {
 		samples[Si] = individualSampleBytes[Si*n : (Si+1)*n]
@@ -684,8 +669,8 @@ func calculateDistance(individualSampleBytes []byte, samples [][]byte, n int) []
 		/////////////////////////DISTANCES/////////////////////////////////////
 		// Distance𝑖 = Lshiftbit(Si(3), 6) + Rshiftbit(Si(2), 2)
 		// This variable represents the distance in millimeters.
-		// uint16(samples[Si][2]) << 6 means we take the whole third byte of this grouping and shift it 6 bits to the left.
-		// uint16(samples[Si][1]) >> 2 means we take the whole second byte of this grouping and shift it 2 bits to the right.
+		// uint16(samples[Si][1]) >> 2 means we take the first/high 6 bits via shifting it 2 bits to the right
+		// uint16(samples[Si][2]) << 6 means we take the last/low 2 bits via shifting it 6 bits to the left
 		distance := (uint16(samples[Si][2]) << 6) + (uint16(samples[Si][1]) >> 2)
 		distances[Si] = float32(distance)
 	}
