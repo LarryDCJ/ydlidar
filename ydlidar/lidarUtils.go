@@ -422,88 +422,38 @@ func (lidar *YDLidar) StartScan() {
 					n := 3
 					samples := make([][]byte, len(individualSampleBytes)/n)
 
-					intensities := make([]uint16, len(individualSampleBytes)/n)
-					distances := make([]uint16, len(individualSampleBytes)/n)
+					intensities := make([]int, len(individualSampleBytes)/n)
+					distances := make([]float32, len(individualSampleBytes)/n)
 					for Si := range samples {
 						samples[Si] = individualSampleBytes[Si*n : (Si+1)*n]
 						// uint16(samples[Si][0]) means we take the whole first byte of this grouping
 						// uint16(samples[Si][1]&0x3) means...&0x3 leaves us with the low two bits of the 2nd byte.
-						intensity := (uint16(samples[Si][0]) + uint16(samples[Si][1]&3<<8)) * 256
-						intensities[Si] = intensity
+						intensity := int(samples[Si][0])
+						IH := int(samples[Si][1] & 0x3)
+						intensities[Si] = intensity + IH*256
 						log.Printf("intensity: %v", intensity)
 
+						/////////////////////////DISTANCES/////////////////////////////////////
 						// Distance𝑖 = Lshiftbit(Si(3), 6) + Rshiftbit(Si(2), 2)
 						// This variable represents the distance in millimeters.
 						// uint16(samples[Si][2]) << 6 means we take the whole third byte of this grouping and shift it 6 bits to the left.
 						// uint16(samples[Si][1]) >> 2 means we take the whole second byte of this grouping and shift it 2 bits to the right.
 						distance := (uint16(samples[Si][2]) << 6) + (uint16(samples[Si][1]) >> 2)
-						distances[Si] = distance
+						distances[Si] = float32(distance)
 
 						log.Printf("distance: %vmm", distance)
 					}
 
-					// Contains distance and intensity data
-					testSamplePacket := []byte{0x64, 0xE5, 0x6F}
-
-					testReadableDistance := (uint16(testSamplePacket[2]) << 6) + (uint16(testSamplePacket[1]) >> 2)
-					if testReadableDistance == 7161 {
-						log.Printf("TEST READABLE DISTANCE: %v mm", testReadableDistance)
-					}
-
-					intensityByte1 := testSamplePacket[0]
-					intensityByte2 := testSamplePacket[1] & 0x3
-
-					if intensityByte1 == 100 {
-						log.Printf("TEST INTENSITY BYTE 1: %v", intensityByte1)
-					}
-
-					if intensityByte2 == 1 {
-						log.Printf("TEST INTENSITY BYTE 2: %v", intensityByte2)
-					}
-
-					testReadableIntensity := uint16(testSamplePacket[0]) + uint16(testSamplePacket[1]&0x3)*256
-					if testReadableIntensity == 356 {
-						log.Printf("TEST READABLE INTENSITY: %v", testReadableIntensity)
-					}
-
-					// Contains angle data (LSA and FSA) and the first byte is the sample length
-					testAngle := []byte{0x28, 0xE5, 0x6F, 0xBD, 0x79}
-
-					testReadableLSN := testAngle[0] // correct
-					if testReadableLSN == 40 {
-						log.Printf("TEST READABLE LSN: %v", testReadableLSN)
-					}
-
-					testRawFSA := (uint16(testAngle[2]) << 8) | uint16(testAngle[1])
-					testReadableFSA := float32(testRawFSA>>1) / 64
-
-					if testReadableFSA == 223.78125 {
-						log.Printf("TEST READABLE FSA: %v", testReadableFSA)
-					}
-
-					testRawLSA := (uint16(testAngle[4]) << 8) | uint16(testAngle[3])
-					testReadableLSA := float32(testRawLSA>>1) / 64
-
-					if testReadableLSA == 243.46875 {
-						log.Printf("TEST READABLE LSA: %v", testReadableLSA)
-					}
-
-					testReadableAngleDiff := testReadableLSA - testReadableFSA
-					if testReadableAngleDiff == 19.6875 {
-						log.Printf("TEST READABLE ANGLE DIFF: %v", testReadableAngleDiff)
-					}
-
 					//////////////////////////////Angle Calculations//////////////////////////////////
-					angleFSA, angleLSA, angleDelta := lidar.CalculateAngles(distances, pointCloud.StartAngle, pointCloud.EndAngle, sampleQuantityPackets)
+					angles := calculateAngles(distances, pointCloud.StartAngle, pointCloud.EndAngle, sampleQuantityPackets)
 					/////////////////////////////////////////////////////////////////////////////////
 
 					// Send the packet to the channel.
 					lidar.Packets <- Packet{
-						FirstAngle:         angleFSA,
-						LastAngle:          angleLSA,
-						DeltaAngle:         angleDelta,
-						NumDistanceSamples: int(pointCloud.SampleQuantity),
+						NumDistanceSamples: int(sampleQuantityPackets),
+						Angles:             angles,
 						Distances:          distances,
+						Intensities:        intensities,
 						PacketType:         pointCloud.PackageType,
 						Error:              err,
 					}
@@ -650,19 +600,21 @@ func GetPointCloud(packet Packet) (pointClouds []PointCloudData) {
 		pointClouds = append(pointClouds,
 			PointCloudData{
 				Intensity: packet.Intensities[0],
-				Angle:     packet.FirstAngle,
+				Angle:     packet.Angles[0],
 				Dist:      packet.Distances[0],
 			})
 		return
 	}
 
 	for i, _ := range packet.Distances {
+		intensity := packet.Intensities[i]
 		dist := packet.Distances[i]
-		angle := packet.DeltaAngle/float32(packet.NumDistanceSamples-1)*float32(i) + packet.FirstAngle + angleCorrection(dist)
+		angle := packet.Angles[i]
 		pointClouds = append(pointClouds,
 			PointCloudData{
-				Angle: angle,
-				Dist:  dist,
+				Intensity: intensity,
+				Angle:     angle,
+				Dist:      dist,
 			})
 	}
 	return
@@ -701,45 +653,40 @@ func (lidar *YDLidar) Close() error {
 	return lidar.SerialPort.Close()
 }
 
-// CalculateAngles will shut down the connection.
-func (lidar *YDLidar) CalculateAngles(distances []uint16, endAngle uint16, startAngle uint16, sampleQuantity uint8) (float32, float32, float32) {
-	if sampleQuantity == 1 {
-		return 0, 0, 0
-	}
-	// setup the data
+// calculateAngles calculates the angles of the first and last sample.
+func calculateAngles(distances []float32, endAngle uint16, startAngle uint16, sampleQuantity uint8) []float32 {
 
-	// loop over the data and calculate the angles
+	angles := make([]float32, sampleQuantity)
 
-	realReadableStartAngle := uint16(startAngle>>1) / 64
-	realReadableEndAngle := uint16(endAngle>>1) / 64
-	log.Printf("realReadableStartAngle: %v", realReadableStartAngle)
-	log.Printf("realReadableEndAngle: %v", realReadableEndAngle)
-
-	angleCorFSA := angleCorrection(distances[0])
+	angleCorFSA := angleCorrect(distances[0])
 	angleFSA := float32(startAngle>>1)/64 + angleCorFSA
 
-	angleCorLSA := angleCorrection(distances[sampleQuantity-1])
+	angleCorLSA := angleCorrect(distances[sampleQuantity-1])
 	angleLSA := float32(endAngle>>1)/64 + angleCorLSA
 
-	// Calculate angle delta.
-	var angleDelta float32
-	switch {
-	case angleLSA > angleFSA:
-		angleDelta = angleLSA - angleFSA
-	case angleLSA < angleFSA:
-		angleDelta = 360 + angleLSA - angleFSA
-	case angleLSA == angleFSA:
-		angleDelta = 0
+	angleDiff := float32(math.Mod(float64(float32(angleLSA-angleFSA)), 360))
+
+	for i := 0; i < len(distances); i++ {
+		angle := angleDiff/float32(sampleQuantity-1)*float32(i) + float32(endAngle) + angleCorrect(distances[i])
+		angles[i] = angle
 	}
 
-	return angleFSA, angleLSA, angleDelta
+	return angles
 
 }
 
-// angleCorrection calculates the corrected angle for Lidar.
-func angleCorrection(dist uint16) float32 {
+// angleCorrect calculates the corrected angle for Lidar.
+func angleCorrect(dist float32) float32 {
 	if dist == 0 {
-		return -0
+		return 0
 	}
 	return float32(180 / math.Pi * math.Atan(21.8*(155.3-float64(dist))/(155.3*float64(dist))))
+}
+
+func calculateIntensity(intensity uint16) float32 {
+	return float32(intensity) / 100
+}
+
+func calculateDistance(distance uint16) float32 {
+	return float32(distance) / 4
 }
