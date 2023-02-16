@@ -2,7 +2,7 @@ package main
 
 import (
 	"log"
-	. "ydlidar/ydlidar"
+	. "ydlidarg2/ydlidar"
 )
 
 func main() {
