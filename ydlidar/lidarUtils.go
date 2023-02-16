@@ -137,11 +137,6 @@ func (lidar *YDLidar) SetupCloseHandler() {
 			return
 		}
 
-		err = lidar.SerialPort.ResetOutputBuffer()
-		if err != nil {
-			return
-		}
-
 		err = lidar.Close()
 		if err != nil {
 			return
@@ -579,8 +574,14 @@ func (lidar *YDLidar) StopScan() error {
 		return err
 	}
 	lidar.Stop <- struct{}{}
-	lidar.SerialPort.ResetOutputBuffer()
-	lidar.SerialPort.ResetInputBuffer()
+	err := lidar.SerialPort.ResetOutputBuffer()
+	if err != nil {
+		return err
+	}
+	err = lidar.SerialPort.ResetInputBuffer()
+	if err != nil {
+		return err
+	}
 	return nil
 
 }
@@ -667,7 +668,7 @@ func calculateDistances(individualSampleBytes []byte, samples [][]byte, n int) [
 		samples[Si] = individualSampleBytes[Si*n : (Si+1)*n]
 
 		/////////////////////////DISTANCES/////////////////////////////////////
-		// Distance𝑖 = Lshiftbit(Si(3), 6) + Rshiftbit(Si(2), 2)
+		// Distance𝑖 = left shift bit(Si(3), 6) + right shift bit(Si(2), 2)
 		// This variable represents the distance in millimeters.
 		// uint16(samples[Si][1]) >> 2 means we take the first/high 6 bits via shifting it 2 bits to the right
 		// uint16(samples[Si][2]) << 6 means we take the last/low 2 bits via shifting it 6 bits to the left
